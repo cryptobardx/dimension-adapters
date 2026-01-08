@@ -19,6 +19,7 @@ const DEFAULTS: any = {
   SWELLCHAIN_ARCHIVAL_RPC: 'https://explorer.swellnetwork.io/api/eth-rpc',
   XRPL_EVM_RPC: 'https://explorer.xrplevm.org/api/eth-rpc',
   MANTLE_ARCHIVAL_RPC: 'https://explorer.mantle.xyz/api/eth-rpc',
+  SAGA_RPC: "https://sagaevm.jsonrpc.sagarpc.io",
   SAGA_WHITELISTED_RPC: 'https://sagaevm-archive.jsonrpc.sagarpc.io',
   CANTO_RPC: 'https://tuber.build/api/eth-rpc',
   APTOS_RPC: 'https://aptos-mainnet.pontem.network',
@@ -69,6 +70,7 @@ export const ENV_KEYS = new Set([
   'SAUCERSWAP_API_KEY',
   'ASTROS_PERP_API_KEY',
   'VOLO_VAULT_API_KEY',
+  'CLICKHOUSE_CONFIG',
 ])
 
 // This is done to support both ZEROx_API_KEY and ZEROX_API_KEY
