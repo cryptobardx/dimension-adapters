@@ -1,6 +1,7 @@
-import { FetchOptions, SimpleAdapter } from '../adapters/types';
+import { FetchOptions, FetchResult, SimpleAdapter } from '../adapters/types';
 import fetchURL from '../utils/fetchURL';
 import { CHAIN } from './chains';
+import * as sdk from "@defillama/sdk";
 
 
 export const fetchPolymarketBuilderVolume = async ({ options, builder }: { options: FetchOptions, builder: string }) => {
@@ -32,6 +33,38 @@ export function polymarketBuilderExports({ builder, start }: { builder: string, 
   }
 
   return adapter as SimpleAdapter
+}
+
+interface GetPolymarketVolumeProps {
+  options: FetchOptions;
+  exchanges: Array<string>;
+  currency: string;
+}
+
+export async function getPolymarketVolume(props: GetPolymarketVolumeProps): Promise<FetchResult> {
+  const { options, exchanges, currency } = props;
+  
+  const dailyVolume = options.createBalances();
+  const dailyNotionalVolume = options.createBalances();
+  
+  const OrderFilledLogs = await options.getLogs({
+    targets: exchanges,
+    eventAbi: 'event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)',
+    flatten: true,
+  });
+
+  for (const log of OrderFilledLogs) {
+    if (log.makerAssetId.toString() === '0') {
+      dailyVolume.add(currency, BigInt(log.makerAmountFilled) / 2n);
+      dailyNotionalVolume.add(currency, BigInt(log.takerAmountFilled) / 2n);
+    }
+    else if (log.takerAssetId.toString() === '0') {
+      dailyVolume.add(currency, BigInt(log.takerAmountFilled) / 2n);
+      dailyNotionalVolume.add(currency, BigInt(log.makerAmountFilled) / 2n)
+    }
+  }
+
+  return { dailyVolume, dailyNotionalVolume };
 }
 
 

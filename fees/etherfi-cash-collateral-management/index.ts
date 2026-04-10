@@ -3,206 +3,168 @@ import { CHAIN } from "../../helpers/chains";
 import { queryDuneSql } from "../../helpers/dune";
 import { METRIC } from "../../helpers/metrics";
 
-const MetricLabels = {
-  CASH_TRANSACTION_FEES: 'Cash Transaction Fees',
-  BORROW_INTEREST: METRIC.BORROW_INTEREST,
-  CASHBACKS: 'Cashbacks'
-};
-
-const getCashRevenueStreams = async (options: FetchOptions) => {
-  const query = `
-    with
-
-    -- ether.fi cash spend events (transaction fees)
-    spend_events as (
-        select
-            bytearray_to_uint256(bytearray_substring(data,33,32))/1e6 as spend_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address in (0x5423885B376eBb4e6104b8Ab1A908D350F6A162e, 0x380B2e96799405be6e3D965f4044099891881acB)
-        and topic0 = 0xe70f33131caa91c15ec116944772ba79bcc4cd6501cdfa178d66f903a796759a
-
-        union all
-
-        select
-            bytearray_to_uint256(bytearray_substring(data,33,32))/1e6 as spend_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address = 0x380B2e96799405be6e3D965f4044099891881acB
-        and topic0 = 0xbe1dc90fb3facc4238834ef8da43ef4f286440a3546f49a89ebb82efb37f21cb
-
-        union all
-
-        select
-            bytearray_to_uint256(bytearray_substring(data, 321, 32)) / 1e6 as spend_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address = 0x380B2e96799405be6e3D965f4044099891881acB
-        and topic0 = 0x244f4cc0665ad7ee4709aa59b30d3ea581cecde1b0430a3f23a5dc609d4890fc
+async function prefetch(options: FetchOptions) {
+  const duneQuery = `
+    with 
+    
+    time_seq AS (
+        select 
+            sequence(
+            cast('2024-01-01' as timestamp),
+            date_trunc('day', cast(now() as timestamp)),
+            interval '1' day
+            ) as time 
     ),
-
-    -- ether.fi cash spends revenue (1.38% fee)
-    cash_spends_revenue as (
+    
+    days AS (
         select
-            'cash_spends' as revenue_source,
-            sum(0.0138 * spend_usd) as revenue_usd
-        from
-        spend_events
+            time.time as day
+        from 
+        time_seq
+        cross join unnest(time) AS time(time)
     ),
-
-    -- ether.fi cash borrows revenue (direct calculation from queries)
-    cash_borrows_revenue as (
-        select
-            'cash_borrows' as revenue_source,
-            sum(daily_revenue) as revenue_usd
-        from
-        query_5535845
-        where day = date(from_unixtime(${options.startOfDay}))
+    
+    hours as (
+        select 
+            * 
+        from (
+            select 
+                date_add('hour', hour, day) as hour
+            from (
+                select 
+                    day 
+                from 
+                days 
+            ) cross join unnest(sequence(0, 23)) as h(hour)
+        )
     ),
-
-    -- ether.fi cash cashback events
-    cashback_events as (
-        select
-            bytearray_to_uint256(bytearray_substring(data,65,32))/1e6 as cashback_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address = 0x5423885B376eBb4e6104b8Ab1A908D350F6A162e
-        and topic0 = 0xc2f328aca2253ffbf4bdb01552106555dbedd5b21bc86578abbbb849d73613a6
-
-        union all
-
-        select
-            bytearray_to_uint256(bytearray_substring(data,97,32))/1e6 + bytearray_to_uint256(bytearray_substring(data,161,32))/1e6 as cashback_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address = 0x380B2e96799405be6e3D965f4044099891881acB
-        and topic0 = 0xeb47a17fe64c36c7ac73cc029dd561d73e8df11215ed25fbb8c30653bf6d3a72
-
-        union all
-
-        select
-            bytearray_to_uint256(bytearray_substring(data,97,32))/1e6 as cashback_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address = 0x380B2e96799405be6e3D965f4044099891881acB
-        and topic0 = 0x0b79a9660f2e7ba216d6c8c6aa4a73dff96833d3c0b14a067da90c3b1f3118dc
-
-        union all
-
-        select
-            bytearray_to_uint256(bytearray_substring(data,97,32))/1e6 as cashback_usd
-        from
-        scroll.logs
-        where TIME_RANGE
-        and contract_address = 0x380B2e96799405be6e3D965f4044099891881acB
-        and topic0 = 0x89d3571a498b5d3d68599f5f00c3016f9604aafa7701c52c1b04109cd909a798
+    
+    events as (
+        select 
+            blockchain,
+            date_trunc('hour', block_time) as hour, 
+            sum(case when event_type = 'borrow' then token_amount_usd else -token_amount_usd end) as amount 
+        from 
+        (
+            select 
+            *, 
+            cast(now() as timestamp) as last_updated 
+            from 
+                "query_6819705(start_date='date_trunc(\\'day\\', now() - interval \\'1\\' day)')"
+            
+            union all 
+            
+            select 
+                * 
+            from 
+                dune.ether_fi.result_etherfi_cash_events
+            where block_date < date_trunc('day', now() - interval '1' day)
+        )
+        where event_type in ('borrow', 'repay')
+        and blockchain in ('scroll', 'optimism')
+        group by 1, 2
     ),
-
-    -- ether.fi cashbacks revenue
-    cash_cashbacks_revenue as (
-        select
-            'cash_cashbacks' as revenue_source,
-            sum(cashback_usd) as revenue_usd
+    
+    tokens_supply_cum as (
+        select 
+            blockchain,
+            hour,
+            sum(amount) over (partition by blockchain order by hour) as token_supply,
+            lead(hour, 1, current_timestamp) over (partition by blockchain order by hour) as next_hour
         from
-        cashback_events
+        events
+    ),
+    
+    hourly_balance as (
+        select 
+            t.blockchain,
+            h.hour, 
+            t.token_supply
+        from 
+        tokens_supply_cum t
+        inner join
+        hours h 
+            on t.hour <= h.hour 
+            and h.hour < t.next_hour
+    ),
+    
+    get_values as (
+        select 
+            gv.blockchain,
+            gv.hour,
+            4 as platform_fee, 
+            gv.token_supply,
+            gv.token_supply * 1 as token_supply_type,
+            gv.token_supply * 1 as token_supply_usd, 
+            1 as base_asset_type_price 
+        from 
+        hourly_balance gv 
     )
+    
+    select 
+        blockchain,
+        day,
+        sum((cast(platform_fee as double)/100 * token_supply_type * base_asset_type_price)/365) as revenue_usd
+    from (
+        select 
+            blockchain,
+            date_trunc('day', hour) as day, 
+            avg(platform_fee) as platform_fee, 
+            avg(token_supply) as token_supply,
+            avg(token_supply_type) as token_supply_type,
+            max_by(base_asset_type_price, hour) as base_asset_type_price
+        from 
+            get_values 
+        where date_trunc('day', hour) = date(from_unixtime(${options.startOfDay}))
+        group by 1, 2
+    )
+    group by 1, 2
+  `
 
-    -- Combine all revenue sources
-    select revenue_source, revenue_usd from cash_spends_revenue
-    union all
-    select revenue_source, revenue_usd from cash_borrows_revenue
-    union all
-    select revenue_source, revenue_usd from cash_cashbacks_revenue`;
-
-  const result = await queryDuneSql(options, query);
-  const revenues = {
-    cashSpends: 0,
-    cashBorrows: 0,
-    cashCashbacks: 0
-  };
-
-  if (result && result.length > 0) {
-    result.forEach((row: any) => {
-      switch (row.revenue_source) {
-        case 'cash_spends':
-          revenues.cashSpends = Number(row.revenue_usd || 0);
-          break;
-        case 'cash_borrows':
-          revenues.cashBorrows = Number(row.revenue_usd || 0);
-          break;
-        case 'cash_cashbacks':
-          revenues.cashCashbacks = Number(row.revenue_usd || 0);
-          break;
-      }
-    });
-  }
-  return revenues;
-};
+  return await queryDuneSql(options, duneQuery)
+}
 
 const fetch = async (_a: any, _b: any, options: FetchOptions) => {
   const dailyFees = options.createBalances();
-  const dailyRevenue = options.createBalances();
-  const dailySupplySideRevenue = options.createBalances();
 
-  const cashRevenues = await getCashRevenueStreams(options);
-
-  // Cash transaction fees (1.38% on card spends) - protocol revenue
-  if (cashRevenues.cashSpends > 0) {
-    dailyFees.addUSDValue(cashRevenues.cashSpends, MetricLabels.CASH_TRANSACTION_FEES);
-    dailyRevenue.addUSDValue(cashRevenues.cashSpends, MetricLabels.CASH_TRANSACTION_FEES);
+  const results = options.preFetchedResults;
+  
+  const chainResult = results.find((r: any) => r.blockchain === options.chain);
+  if (chainResult) {
+    // Borrow interest from cash lending - protocol revenue
+    dailyFees.addUSDValue(chainResult.revenue_usd, METRIC.BORROW_INTEREST);
   }
-
-  // Borrow interest from cash lending - protocol revenue
-  if (cashRevenues.cashBorrows > 0) {
-    dailyFees.addUSDValue(cashRevenues.cashBorrows, MetricLabels.BORROW_INTEREST);
-    dailyRevenue.addUSDValue(cashRevenues.cashBorrows, MetricLabels.BORROW_INTEREST);
-  }
-
-  // Cashbacks paid to users - supply side revenue (paid by external providers)
-  if (cashRevenues.cashCashbacks > 0) {
-    dailyFees.addUSDValue(cashRevenues.cashCashbacks, MetricLabels.CASHBACKS);
-    dailySupplySideRevenue.addUSDValue(cashRevenues.cashCashbacks, MetricLabels.CASHBACKS);
-  }
-
+  
   return {
     dailyFees,
-    dailyRevenue,
-    dailyProtocolRevenue: dailyRevenue,
-    dailySupplySideRevenue,
+    dailyRevenue: dailyFees,
+    dailyProtocolRevenue: dailyFees,
+    dailyHoldersRevenue: 0,
   };
 };
 
 const adapter: Adapter = {
   version: 1,
   fetch,
-  chains: [CHAIN.SCROLL],
+  prefetch,
+  adapter: {
+    [CHAIN.SCROLL]: { start: '2024-11-01' },
+    [CHAIN.OPTIMISM]: { start: '2026-04-08' },
+  },
   dependencies: [Dependencies.DUNE],
-  start: '2024-11-01',
   isExpensiveAdapter: true,
   methodology: {
-    Fees: "Total fees generated from EtherFi Cash services on Scroll including transaction fees, borrow interest, and cashbacks.",
-    Revenue: "Protocol's share of fees from EtherFi Cash operations including transaction fees and borrow interest.",
-    ProtocolRevenue: "Same as Revenue - all protocol earnings from EtherFi Cash on Scroll.",
-    SupplySideRevenue: "Cashback rewards paid to users by external providers.",
+    Fees: "Total borrow interest generated from EtherFi Cash services on Scroll and OP Mainnet.",
+    Revenue: "Protocol's share of fees from borrow interest.",
+    ProtocolRevenue: "Same as Revenue - all protocol earnings from EtherFi Cash on Scroll and OP Mainnet.",
+    HoldersRevenue: "No revenue share to ETHFI holders",
   },
   breakdownMethodology: {
     Fees: {
-      [MetricLabels.CASH_TRANSACTION_FEES]: '1.38% transaction fees from EtherFi Cash card usage on Scroll',
-      [MetricLabels.BORROW_INTEREST]: 'Interest earned from EtherFi Cash lending operations on Scroll',
-      [MetricLabels.CASHBACKS]: 'Cashback rewards paid to card users by external providers on Scroll',
+      [METRIC.BORROW_INTEREST]: 'Interest earned from EtherFi Cash lending operations on Scroll and OP Mainnet',
     },
     Revenue: {
-      [MetricLabels.CASH_TRANSACTION_FEES]: '1.38% transaction fees from EtherFi Cash card usage on Scroll',
-      [MetricLabels.BORROW_INTEREST]: 'Interest earned from EtherFi Cash lending operations on Scroll',
-    },
-    SupplySideRevenue: {
-      [MetricLabels.CASHBACKS]: 'Cashback rewards paid to card users by external providers on Scroll',
+      [METRIC.BORROW_INTEREST]: 'Interest earned from EtherFi Cash lending operations on Scroll and OP Mainnet',
     },
   }
 };
